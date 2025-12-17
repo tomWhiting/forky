@@ -1,6 +1,6 @@
 {
   "name": "forky",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Fork Claude sessions to handle side tasks in parallel",
   "author": {
     "name": "Tom Whiting",

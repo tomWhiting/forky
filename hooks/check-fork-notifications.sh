@@ -1,7 +1,7 @@
 #!/bin/bash
-# Check for fork completion notifications for the current session
+# Check for fork completion notifications
 
-NOTIF_FILE="$HOME/.forky/notifications/${CLAUDE_SESSION_ID}.txt"
+NOTIF_FILE="$HOME/.forky/notifications/pending.txt"
 
 if [ -f "$NOTIF_FILE" ]; then
     # Read notifications
@@ -11,23 +11,21 @@ if [ -f "$NOTIF_FILE" ]; then
         # Clear the file after reading
         rm "$NOTIF_FILE"
 
-        # Output as JSON with additional context for Claude
-        # Format: fork_id|timestamp|summary
-        CONTEXT=""
+        # Build context message
+        CONTEXT="📬 Fork(s) completed:\\n"
         while IFS='|' read -r fork_id timestamp summary; do
             if [ -n "$fork_id" ]; then
-                CONTEXT="${CONTEXT}Fork ${fork_id} completed at ${timestamp}: ${summary}\n"
+                CONTEXT="${CONTEXT}  • ${fork_id}: ${summary}\\n"
             fi
         done <<< "$NOTIFICATIONS"
 
-        if [ -n "$CONTEXT" ]; then
-            cat << EOF
+        # Output JSON that blocks stopping with notification
+        cat << EOF
 {
   "decision": "block",
-  "reason": "Your forked session(s) completed. Please acknowledge:\n${CONTEXT}"
+  "reason": "${CONTEXT}Please acknowledge these fork completions."
 }
 EOF
-        fi
     fi
 fi
 
