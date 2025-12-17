@@ -1,0 +1,12 @@
+{
+  "name": "forky",
+  "version": "1.0.0",
+  "description": "Fork Claude sessions to handle side tasks in parallel",
+  "author": {
+    "name": "Tom Whiting",
+    "url": "https://github.com/tomWhiting"
+  },
+  "repository": "https://github.com/tomWhiting/forky",
+  "license": "MIT",
+  "keywords": ["fork", "session", "parallel", "background", "multitasking"]
+}

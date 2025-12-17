@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (binaries are committed for distribution)
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local development
+.env
+.env.local
