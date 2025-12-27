@@ -1,32 +1,289 @@
 //! CLI command execution.
+//!
+//! This is a thin client - all database operations go through the server.
+
+use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::claude::{spawn_claude, ClaudeOptions};
-use crate::db::{Database, ForkQueries, JobQueries, MessageQueries, SessionQueries};
-use crate::models::{Fork, ForkStatus, Job, JobStatus, Message, MessageRole, Session};
+use crate::claude::{spawn_claude, ClaudeEvent, ClaudeOptions};
+use crate::server;
 use crate::session::detect_session_id;
 
 use super::args::{Cli, Commands, ListEntity};
 
-/// Generate a short random ID for forks/jobs.
-fn generate_short_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    (0..8)
-        .map(|_| chars[rng.random_range(0..chars.len())])
-        .collect()
-}
-
-/// Generate a `UUIDv7` for session IDs (time-ordered, visually distinct).
-fn generate_session_id() -> String {
+/// Generate a UUIDv7 (time-ordered, globally unique).
+fn generate_uuid() -> String {
     Uuid::now_v7().to_string()
 }
 
-/// CLI options that get passed through to Claude.
+/// Get the current project path.
+fn get_project_path() -> Result<PathBuf> {
+    let mut current = std::env::current_dir().context("Failed to get current directory")?;
+
+    loop {
+        if current.join(".claude").is_dir() {
+            return Ok(current);
+        }
+
+        if !current.pop() {
+            bail!("Could not find .claude directory. Are you in a Claude Code project?");
+        }
+    }
+}
+
+/// Result of worktree setup.
+struct WorktreeInfo {
+    path: PathBuf,
+    branch: String,
+}
+
+/// Set up a git worktree for the fork.
+fn setup_worktree(fork_id: &str) -> Result<WorktreeInfo> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        bail!(
+            "Not in a git repository: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+
+    let worktrees_dir = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join(".forky")
+        .join("worktrees");
+    std::fs::create_dir_all(&worktrees_dir)
+        .with_context(|| format!("Failed to create {}", worktrees_dir.display()))?;
+
+    let short_id = &fork_id[..8.min(fork_id.len())];
+    let branch_name = format!("forky/{short_id}");
+    let worktree_path = worktrees_dir.join(short_id);
+
+    if worktree_path.exists() {
+        let _ = Command::new("git")
+            .current_dir(&repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree_path)
+            .output();
+        let _ = Command::new("git")
+            .current_dir(&repo_root)
+            .args(["branch", "-D", &branch_name])
+            .output();
+    }
+
+    let output = Command::new("git")
+        .current_dir(&repo_root)
+        .args(["branch", &branch_name])
+        .output()
+        .context("Failed to create git branch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("already exists") {
+            bail!("Failed to create branch {branch_name}: {stderr}");
+        }
+    }
+
+    let output = Command::new("git")
+        .current_dir(&repo_root)
+        .args(["worktree", "add"])
+        .arg(&worktree_path)
+        .arg(&branch_name)
+        .output()
+        .context("Failed to create git worktree")?;
+
+    if !output.status.success() {
+        bail!(
+            "Failed to create worktree at {}: {}",
+            worktree_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(WorktreeInfo {
+        path: worktree_path,
+        branch: branch_name,
+    })
+}
+
+// === HTTP Client for Server Communication ===
+
+/// Fork summary from server.
+#[derive(Debug, Deserialize)]
+struct ForkSummary {
+    project_path: String,
+    fork_id: String,
+    session_id: Option<String>,
+    parent_session_id: Option<String>,
+    status: String,
+    event_count: usize,
+    created_at: Option<String>,
+}
+
+/// Create a fork via the server.
+async fn create_fork_on_server(
+    port: u16,
+    project_path: &str,
+    fork_id: &str,
+    parent_session_id: Option<&str>,
+) -> Result<()> {
+    let url = format!("http://127.0.0.1:{port}/api/forks");
+    let body = serde_json::json!({
+        "project_path": project_path,
+        "fork_id": fork_id,
+        "parent_session_id": parent_session_id,
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to create fork on server")?;
+
+    if !resp.status().is_success() {
+        bail!("Server returned {}", resp.status());
+    }
+
+    Ok(())
+}
+
+/// Update fork status via the server.
+async fn update_fork_status_on_server(
+    port: u16,
+    project_path: &str,
+    fork_id: &str,
+    status: &str,
+    session_id: Option<&str>,
+) -> Result<()> {
+    let url = format!("http://127.0.0.1:{port}/api/forks/{fork_id}");
+    let body = serde_json::json!({
+        "project_path": project_path,
+        "status": status,
+        "session_id": session_id,
+    });
+
+    let resp = reqwest::Client::new()
+        .patch(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to update fork on server")?;
+
+    if !resp.status().is_success() {
+        bail!("Server returned {}", resp.status());
+    }
+
+    Ok(())
+}
+
+/// Get forks from the server.
+async fn get_forks_from_server(port: u16, project_path: Option<&str>) -> Result<Vec<ForkSummary>> {
+    let mut url = format!("http://127.0.0.1:{port}/api/forks");
+    if let Some(p) = project_path {
+        url = format!("{url}?project_path={}", urlencoding::encode(p));
+    }
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to get forks from server")?;
+
+    if !resp.status().is_success() {
+        bail!("Server returned {}", resp.status());
+    }
+
+    let forks: Vec<ForkSummary> = resp.json().await.context("Failed to parse forks")?;
+    Ok(forks)
+}
+
+/// Send events to the server for storage.
+async fn send_events_to_server(
+    port: u16,
+    project_path: &str,
+    events: &[ClaudeEvent],
+    fork_id: Option<&str>,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let url = format!("http://127.0.0.1:{port}/api/events");
+    let events_json: Vec<_> = events.iter().map(|e| &e.raw).collect();
+
+    let body = serde_json::json!({
+        "project_path": project_path,
+        "fork_id": fork_id,
+        "events": events_json,
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to send events to server")?;
+
+    if !resp.status().is_success() {
+        bail!("Server returned {}", resp.status());
+    }
+
+    Ok(())
+}
+
+/// Get events from the server.
+#[derive(Debug, Deserialize)]
+struct StoredEvent {
+    fork_id: Option<String>,
+    uuid: Option<String>,
+    session_id: Option<String>,
+    event_type: String,
+    message: Option<String>,
+    thinking: Option<String>,
+    role: Option<String>,
+}
+
+async fn get_events_from_server(
+    port: u16,
+    project_path: &str,
+    fork_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<StoredEvent>> {
+    let mut url = format!(
+        "http://127.0.0.1:{port}/api/events?project_path={}&limit={limit}",
+        urlencoding::encode(project_path)
+    );
+    if let Some(fid) = fork_id {
+        url = format!("{url}&fork_id={fid}");
+    }
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to get events from server")?;
+
+    if !resp.status().is_success() {
+        bail!("Server returned {}", resp.status());
+    }
+
+    let events: Vec<StoredEvent> = resp.json().await.context("Failed to parse events")?;
+    Ok(events)
+}
+
+// === CLI Options ===
+
 #[derive(Debug, Clone, Default)]
 pub struct ForkOptions {
     pub model: Option<String>,
@@ -66,9 +323,9 @@ impl From<&Cli> for ForkOptions {
     }
 }
 
-/// Execute the CLI command.
+// === Command Execution ===
+
 pub async fn execute(cli: Cli) -> Result<()> {
-    let db = Database::open().context("Failed to open database")?;
     let opts = ForkOptions::from(&cli);
 
     // Handle -l flag (message last fork)
@@ -77,39 +334,40 @@ pub async fn execute(cli: Cli) -> Result<()> {
         if message.is_empty() {
             bail!("Message is required when using -l flag");
         }
-        return message_last_fork(&db, &message, &opts).await;
+        return message_last_fork(&message, &opts).await;
     }
 
-    // Handle subcommands
     match cli.command {
         Some(Commands::ForkMe { message }) => {
             let message = message.join(" ");
             if message.is_empty() {
                 bail!("Message is required for fork-me command");
             }
-            fork_current_session(&db, &message, &opts).await
+            fork_current_session(&message, &opts).await
         }
         Some(Commands::Fork { id, message }) => {
             let message = message.join(" ");
             if message.is_empty() {
                 bail!("Message is required for fork command");
             }
-            fork_specific_session(&db, &id, &message, &opts).await
+            fork_specific_session(&id, &message, &opts).await
         }
         Some(Commands::Resume { id, message }) => {
             let message = message.join(" ");
             if message.is_empty() {
                 bail!("Message is required for resume command");
             }
-            resume_session(&db, &id, &message, &opts).await
+            resume_session(&id, &message, &opts).await
         }
-        Some(Commands::List { entity }) => list_entities(&db, entity),
-        Some(Commands::Messages { fork_id }) => list_messages(&db, &fork_id),
+        Some(Commands::List { entity }) => list_entities(entity).await,
+        Some(Commands::Messages { fork_id }) => list_messages(&fork_id).await,
         Some(Commands::Read { id, all }) => {
             if all {
-                mark_all_read(&db)
+                println!("Mark all read not yet implemented via server");
+                Ok(())
             } else if let Some(id) = id {
-                mark_read(&db, &id)
+                println!("Mark {id} read not yet implemented via server");
+                Ok(())
             } else {
                 bail!("Either --all or an ID is required for read command");
             }
@@ -119,20 +377,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
             if message.is_empty() {
                 bail!("Message is required for new command");
             }
-            start_new_session(&db, &message, &opts).await
+            start_new_session(&message, &opts).await
         }
         Some(Commands::Done { fork_id, summary }) => {
             let summary = summary.join(" ");
-            fork_done(&db, &fork_id, &summary)
+            fork_done(&fork_id, &summary).await
         }
-        Some(Commands::Serve { port, open }) => {
-            serve_ui(port, open).await
-        }
+        Some(Commands::Serve { port, open }) => serve_ui(port, open).await,
+        Some(Commands::Events { session, limit }) => list_events(session.as_deref(), limit).await,
         None => {
-            // Default behavior: fork current session with message
             let message = cli.message.join(" ");
             if message.is_empty() {
-                // No message provided, show help
                 println!("Forky - Fork Claude sessions to handle side tasks in parallel");
                 println!();
                 println!("Usage: forky [OPTIONS] [MESSAGE]...");
@@ -144,7 +399,6 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 println!("  resume <ID>    Resume a specific session");
                 println!("  list <TYPE>    List forks, sessions, or jobs");
                 println!("  messages <ID>  View messages for a fork");
-                println!("  read <ID>      Mark a fork as read");
                 println!("  new            Start a fresh Claude session");
                 println!("  serve          Start the observability UI server");
                 println!();
@@ -153,116 +407,83 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 println!("  -m, --model      Model to use for Claude");
                 println!("  --worktree       Run in a git worktree");
                 println!("  --dir <PATH>     Directory to run in");
-                println!("  --chrome         Enable Chrome integration");
-                println!("  --no-chrome      Disable Chrome integration");
                 println!("  -h, --help       Print help");
-                println!("  -V, --version    Print version");
                 return Ok(());
             }
-            fork_current_session(&db, &message, &opts).await
+            fork_current_session(&message, &opts).await
         }
     }
 }
 
-/// Fork the current session.
-async fn fork_current_session(db: &Database, message: &str, opts: &ForkOptions) -> Result<()> {
+async fn fork_current_session(message: &str, opts: &ForkOptions) -> Result<()> {
     let parent_session_id = detect_session_id()?;
 
     if parent_session_id.is_none() {
         println!("Warning: Could not detect current session ID. Starting fresh session.");
     }
 
-    run_fork(db, parent_session_id.as_deref(), message, opts, true).await
+    run_fork(parent_session_id.as_deref(), message, opts, true).await
 }
 
-/// Fork a specific session.
-async fn fork_specific_session(
-    db: &Database,
-    session_id: &str,
-    message: &str,
-    opts: &ForkOptions,
-) -> Result<()> {
-    run_fork(db, Some(session_id), message, opts, true).await
+async fn fork_specific_session(session_id: &str, message: &str, opts: &ForkOptions) -> Result<()> {
+    run_fork(Some(session_id), message, opts, true).await
 }
 
-/// Message the last fork.
-async fn message_last_fork(db: &Database, message: &str, opts: &ForkOptions) -> Result<()> {
-    let fork = ForkQueries::get_latest(db.conn())?.context("No forks found")?;
+async fn message_last_fork(message: &str, opts: &ForkOptions) -> Result<()> {
+    let port = server::ensure_server_running()?;
+    let project_path = get_project_path()?;
+    let project_str = project_path.to_string_lossy();
+
+    let forks = get_forks_from_server(port, Some(&project_str)).await?;
+    let fork = forks.first().context("No forks found")?;
 
     let session_id = fork
-        .fork_session_id
+        .session_id
         .as_deref()
         .or(fork.parent_session_id.as_deref())
         .context("Fork has no session ID")?;
 
-    run_fork(db, Some(session_id), message, opts, false).await
+    run_fork(Some(session_id), message, opts, false).await
 }
 
-/// Resume a specific session (no forking).
-async fn resume_session(
-    db: &Database,
-    session_id: &str,
-    message: &str,
-    opts: &ForkOptions,
-) -> Result<()> {
-    run_fork(db, Some(session_id), message, opts, false).await
+async fn resume_session(session_id: &str, message: &str, opts: &ForkOptions) -> Result<()> {
+    run_fork(Some(session_id), message, opts, false).await
 }
 
-/// Start a fresh session (no parent, no forking).
-async fn start_new_session(db: &Database, message: &str, opts: &ForkOptions) -> Result<()> {
-    run_fork(db, None, message, opts, false).await
+async fn start_new_session(message: &str, opts: &ForkOptions) -> Result<()> {
+    run_fork(None, message, opts, false).await
 }
 
-/// Start the observability UI server.
-#[allow(clippy::unused_async)] // Will use async when WebSocket is implemented
 async fn serve_ui(port: u16, open: bool) -> Result<()> {
-    // TODO: Implement WebSocket server
-    println!("Starting Forky UI server on port {port}...");
-    if open {
-        println!("Opening browser...");
-        // TODO: Open browser
-    }
-    println!("(Server not yet implemented)");
-    Ok(())
+    crate::server::start_server(port, open).await
 }
 
-/// Run a fork/session with the given parameters.
 async fn run_fork(
-    db: &Database,
     parent_session_id: Option<&str>,
     message: &str,
     opts: &ForkOptions,
     fork_session: bool,
 ) -> Result<()> {
-    let fork_id = generate_short_id();
-    let job_id = generate_short_id();
-    // Generate UUIDv7 session ID upfront (time-ordered, visually distinct)
-    let new_session_id = generate_session_id();
+    let project_path = get_project_path()?;
+    let project_str = project_path.to_string_lossy().to_string();
 
-    // Create fork record
-    let fork = Fork::new(fork_id.clone(), parent_session_id.map(String::from));
-    ForkQueries::insert(db.conn(), &fork)?;
+    let fork_id = generate_uuid();
+    let new_session_id = generate_uuid();
 
-    // Create job record
-    let job = Job::new(job_id.clone(), message.to_string(), fork_id.clone());
-    JobQueries::insert(db.conn(), &job)?;
+    // Ensure server is running
+    let port = server::ensure_server_running()?;
 
-    // Store user message
-    let user_msg = Message::new(
-        fork_id.clone(),
-        MessageRole::User,
-        message.to_string(),
-    );
-    MessageQueries::insert(db.conn(), &user_msg)?;
+    // Create fork on server
+    create_fork_on_server(port, &project_str, &fork_id, parent_session_id).await?;
 
     println!("Fork ID: {fork_id}");
     println!("Session ID: {new_session_id}");
     println!("Starting Claude session...");
 
-    // Build callback instruction for the fork
-    // Use ~/.forky/bin/forky as the canonical path (we'll symlink it there)
+    // Build callback instruction
     let forky_path = dirs::home_dir()
-        .map(|h| h.join(".forky").join("bin").join("forky")).map_or_else(|| "forky".to_string(), |p| p.to_string_lossy().to_string());
+        .map(|h| h.join(".forky").join("bin").join("forky"))
+        .map_or_else(|| "forky".to_string(), |p| p.to_string_lossy().to_string());
 
     let callback_instruction = format!(
         "IMPORTANT: You are a forked Claude session (fork ID: {fork_id}). \
@@ -271,31 +492,60 @@ async fn run_fork(
          This notifies the parent session that you're done."
     );
 
-    // Combine user's append_system_prompt with our callback instruction
     let append_prompt = match &opts.append_system_prompt {
         Some(user_prompt) => Some(format!("{user_prompt}\n\n{callback_instruction}")),
         None => Some(callback_instruction),
     };
 
-    // Determine working directory
-    let working_dir = opts.dir.clone().or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
+    // Set up worktree if requested
+    let (working_dir, add_dirs) = if opts.worktree {
+        match setup_worktree(&fork_id) {
+            Ok(info) => {
+                println!("Worktree: {}", info.path.display());
+                println!("Branch: {}", info.branch);
+                let path_str = info.path.to_string_lossy().to_string();
+                (Some(path_str.clone()), vec![path_str])
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to create worktree: {e}");
+                eprintln!("Continuing without worktree...");
+                let dir = opts.dir.clone().or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
+                });
+                let dirs = opts.dir.clone().map_or_else(Vec::new, |d| vec![d]);
+                (dir, dirs)
+            }
+        }
+    } else {
+        let dir = opts.dir.clone().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        });
+        let dirs = opts.dir.clone().map_or_else(Vec::new, |d| vec![d]);
+        (dir, dirs)
+    };
+
+    // Build stream URL for real-time events
+    let stream_url = Some(format!("http://127.0.0.1:{port}/api/events"));
+
+    // Store the initial user prompt
+    let prompt_event_json = serde_json::json!({
+        "type": "user",
+        "uuid": generate_uuid(),
+        "session_id": new_session_id,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": message}]
+        }
     });
-
-    // Build add_dirs list
-    let mut add_dirs = Vec::new();
-    if let Some(ref dir) = opts.dir {
-        add_dirs.push(dir.clone());
+    if let Some(prompt_event) = ClaudeEvent::parse(&prompt_event_json.to_string()) {
+        let _ = send_events_to_server(port, &project_str, &[prompt_event], Some(&fork_id)).await;
     }
 
-    // TODO: Handle worktree creation here
-    if opts.worktree {
-        println!("(Worktree support not yet implemented)");
-    }
-
-    // Spawn Claude with all options
+    // Spawn Claude
     let claude_opts = ClaudeOptions {
         session_id: parent_session_id.map(String::from),
         explicit_session_id: Some(new_session_id.clone()),
@@ -315,57 +565,19 @@ async fn run_fork(
         tools: opts.tools.clone(),
         allowed_tools: opts.allowed_tools.clone(),
         include_partial_messages: opts.include_partial_messages,
+        stream_url: stream_url.clone(),
+        fork_id: Some(fork_id.clone()),
+        project_path: Some(project_str.clone()),
     };
 
     let result = spawn_claude(claude_opts).await?;
 
-    // We know the session ID upfront (UUIDv7), so use it directly
-    // The result.session_id might differ if Claude does something unexpected,
-    // but our explicit_session_id should be respected
+    // Update fork status
+    let status = if result.success { "completed" } else { "failed" };
     let session_id = result.session_id.as_ref().unwrap_or(&new_session_id);
 
-    ForkQueries::update_session_id(db.conn(), &fork_id, session_id)?;
-
-    // Create session record first (before updating job, due to FK constraint)
-    let session = Session::new(session_id.clone(), Some(fork_id.clone()));
-    // Ignore error if session already exists
-    let _ = SessionQueries::insert(db.conn(), &session);
-
-    // Now safe to update job's session_id
-    JobQueries::update_session_id(db.conn(), &job_id, session_id)?;
-
-    // Store assistant response - prefer accumulated messages over result text
-    let assistant_response = if result.messages.is_empty() {
-        result.result.clone()
-    } else {
-        Some(result.messages.join(""))
-    };
-
-    if let Some(ref response) = assistant_response {
-        let assistant_msg = Message::new(
-            fork_id.clone(),
-            MessageRole::Assistant,
-            response.clone(),
-        );
-        MessageQueries::insert(db.conn(), &assistant_msg)?;
-    }
-
-    // Update job status
-    let (job_status, fork_status) = if result.success {
-        (JobStatus::Completed, ForkStatus::Completed)
-    } else {
-        (JobStatus::Failed, ForkStatus::Failed)
-    };
-
-    let completed_at = Some(Utc::now());
-    JobQueries::update_status(
-        db.conn(),
-        &job_id,
-        job_status,
-        result.result.as_deref(),
-        completed_at,
-    )?;
-    ForkQueries::update_status(db.conn(), &fork_id, fork_status, completed_at)?;
+    let _ = update_fork_status_on_server(port, &project_str, &fork_id, status, Some(session_id))
+        .await;
 
     // Print result
     if result.success {
@@ -377,143 +589,132 @@ async fn run_fork(
         println!("\nFork failed.");
     }
 
-    if let Some(ref response) = assistant_response {
+    if !result.messages.is_empty() {
+        let response = result.messages.join("");
+        println!("\nResponse:\n{response}");
+    } else if let Some(ref response) = result.result {
         println!("\nResponse:\n{response}");
     }
 
     Ok(())
 }
 
-/// List entities (forks, sessions, or jobs).
-fn list_entities(db: &Database, entity: ListEntity) -> Result<()> {
+async fn list_entities(entity: ListEntity) -> Result<()> {
+    let port = server::ensure_server_running()?;
+    let project_path = get_project_path()?;
+    let project_str = project_path.to_string_lossy();
+
     match entity {
         ListEntity::Forks => {
-            let forks = ForkQueries::list(db.conn(), None)?;
+            let forks = get_forks_from_server(port, Some(&project_str)).await?;
             if forks.is_empty() {
                 println!("No forks found.");
                 return Ok(());
             }
 
             println!(
-                "{:<10} {:<12} {:<10} {:<6} {:<20}",
-                "ID", "STATUS", "READ", "MSGS", "CREATED"
+                "{:<10} {:<12} {:<8} {:<20}",
+                "ID", "STATUS", "EVENTS", "CREATED"
             );
-            println!("{}", "-".repeat(60));
+            println!("{}", "-".repeat(52));
 
             for fork in forks {
-                let read_status = if fork.read { "yes" } else { "no" };
-                let created = fork.created_at.format("%Y-%m-%d %H:%M");
+                let created = fork.created_at.as_deref().unwrap_or("-");
+                let created_short = if created.len() > 16 {
+                    &created[..16]
+                } else {
+                    created
+                };
                 println!(
-                    "{:<10} {:<12} {:<10} {:<6} {:<20}",
-                    fork.id, fork.status, read_status, "-", created
+                    "{:<10} {:<12} {:<8} {:<20}",
+                    &fork.fork_id[..8.min(fork.fork_id.len())],
+                    fork.status,
+                    fork.event_count,
+                    created_short
                 );
             }
         }
         ListEntity::Sessions => {
-            let sessions = SessionQueries::list(db.conn())?;
-            if sessions.is_empty() {
-                println!("No sessions found.");
-                return Ok(());
-            }
-
-            println!("{:<40} {:<10} {:<20}", "ID", "FORK", "CREATED");
-            println!("{}", "-".repeat(72));
-
-            for session in sessions {
-                let fork_id = session.fork_id.as_deref().unwrap_or("-");
-                let created = session.created_at.format("%Y-%m-%d %H:%M");
-                println!("{:<40} {:<10} {:<20}", session.id, fork_id, created);
-            }
+            println!("Session listing via server not yet implemented.");
+            println!("Use 'forky list forks' to see forks with their session IDs.");
         }
         ListEntity::Jobs => {
-            let jobs = JobQueries::list(db.conn(), None)?;
-            if jobs.is_empty() {
-                println!("No jobs found.");
-                return Ok(());
-            }
-
-            println!(
-                "{:<10} {:<10} {:<12} {:<30}",
-                "ID", "FORK", "STATUS", "DESCRIPTION"
-            );
-            println!("{}", "-".repeat(64));
-
-            for job in jobs {
-                let desc = if job.description.len() > 27 {
-                    format!("{}...", &job.description[..27])
-                } else {
-                    job.description.clone()
-                };
-                println!(
-                    "{:<10} {:<10} {:<12} {:<30}",
-                    job.id, job.fork_id, job.status, desc
-                );
-            }
+            println!("Job listing via server not yet implemented.");
+            println!("Use 'forky list forks' to see forks.");
         }
     }
     Ok(())
 }
 
-/// List messages for a fork.
-fn list_messages(db: &Database, fork_id: &str) -> Result<()> {
-    let messages = MessageQueries::list_for_fork(db.conn(), fork_id)?;
+async fn list_messages(fork_id: &str) -> Result<()> {
+    let port = server::ensure_server_running()?;
+    let project_path = get_project_path()?;
+    let project_str = project_path.to_string_lossy();
 
-    if messages.is_empty() {
+    let events = get_events_from_server(port, &project_str, Some(fork_id), 100).await?;
+
+    if events.is_empty() {
         println!("No messages found for fork {fork_id}.");
         return Ok(());
     }
 
-    for message in messages {
-        let role = match message.role {
-            MessageRole::User => "USER",
-            MessageRole::Assistant => "ASSISTANT",
-            MessageRole::System => "SYSTEM",
-        };
-        let time = message.created_at.format("%H:%M:%S");
-        println!("[{time}] {role}:");
-        println!("{}", message.content);
-        println!();
+    for event in events {
+        let role = event.role.as_deref().unwrap_or(&event.event_type);
+        let role_display = role.to_uppercase();
+
+        if let Some(ref msg) = event.message {
+            println!("[{role_display}]:");
+            println!("{msg}");
+            println!();
+        }
+
+        if let Some(ref thinking) = event.thinking {
+            println!("[{role_display} THINKING]:");
+            let preview = if thinking.len() > 200 {
+                format!("{}...", &thinking[..200])
+            } else {
+                thinking.clone()
+            };
+            println!("{preview}");
+            println!();
+        }
     }
 
     Ok(())
 }
 
-/// Mark a fork as read.
-fn mark_read(db: &Database, fork_id: &str) -> Result<()> {
-    ForkQueries::mark_read(db.conn(), fork_id)?;
-    println!("Marked fork {fork_id} as read.");
-    Ok(())
-}
-
-/// Mark all forks as read.
-fn mark_all_read(db: &Database) -> Result<()> {
-    let count = ForkQueries::mark_all_read(db.conn())?;
-    println!("Marked {count} fork(s) as read.");
-    Ok(())
-}
-
-/// Signal that a fork has completed and notify the parent.
-fn fork_done(_db: &Database, fork_id: &str, summary: &str) -> Result<()> {
+async fn fork_done(fork_id: &str, summary: &str) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    // Create notifications directory
+    // Try to update fork status via server
+    if let Ok(port) = server::get_server_port().ok_or(()).map_err(|_| ()) {
+        if let Ok(project_path) = get_project_path() {
+            let project_str = project_path.to_string_lossy();
+            let _ =
+                update_fork_status_on_server(port, &project_str, fork_id, "completed", None).await;
+        }
+    }
+
+    // Write to notifications file
     let notif_dir = dirs::home_dir()
         .context("Could not find home directory")?
         .join(".forky")
         .join("notifications");
     std::fs::create_dir_all(&notif_dir)?;
 
-    // Write to global pending notifications file
     let notif_file = notif_dir.join("pending.txt");
     let notification = format!(
         "{}|{}|{}\n",
         fork_id,
         Utc::now().format("%Y-%m-%d %H:%M:%S"),
-        if summary.is_empty() { "Fork completed" } else { summary }
+        if summary.is_empty() {
+            "Fork completed"
+        } else {
+            summary
+        }
     );
 
-    // Append to file (multiple forks might complete)
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -523,6 +724,57 @@ fn fork_done(_db: &Database, fork_id: &str, summary: &str) -> Result<()> {
     println!("✓ Fork {fork_id} done");
     if !summary.is_empty() {
         println!("  Summary: {summary}");
+    }
+
+    Ok(())
+}
+
+async fn list_events(session_filter: Option<&str>, limit: usize) -> Result<()> {
+    let port = server::ensure_server_running()?;
+    let project_path = get_project_path()?;
+    let project_str = project_path.to_string_lossy();
+
+    let events = get_events_from_server(port, &project_str, None, limit).await?;
+
+    if events.is_empty() {
+        println!("No events found.");
+        return Ok(());
+    }
+
+    println!("Found {} events:\n", events.len());
+    println!(
+        "{:<8} {:<12} {:<10} {}",
+        "UUID", "TYPE", "ROLE", "MESSAGE"
+    );
+    println!("{}", "-".repeat(70));
+
+    for event in events {
+        // Apply session filter if provided
+        if let Some(filter) = session_filter {
+            if let Some(ref sid) = event.session_id {
+                if !sid.starts_with(filter) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        let uuid = event.uuid.as_deref().unwrap_or("-");
+        let uuid_short = if uuid.len() > 8 { &uuid[..8] } else { uuid };
+
+        let role = event.role.as_deref().unwrap_or("-");
+        let msg = event.message.as_deref().unwrap_or("-");
+        let msg_short = if msg.len() > 35 {
+            format!("{}...", &msg[..32])
+        } else {
+            msg.to_string()
+        };
+
+        println!(
+            "{:<8} {:<12} {:<10} {}",
+            uuid_short, event.event_type, role, msg_short
+        );
     }
 
     Ok(())

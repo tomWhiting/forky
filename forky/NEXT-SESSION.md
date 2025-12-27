@@ -2,44 +2,71 @@
 
 ## What We Did This Session
 
-### 1. Added New CLI Flags
-All Claude CLI flags now wired up in `src/cli/args.rs` and `src/claude/spawn.rs`:
-- `--chrome` / `--no-chrome` - Browser integration
-- `--system-prompt` / `--append-system-prompt` - Prompt control
-- `--worktree` - Git worktree mode (stubbed, not implemented)
-- `--dir` - Run in specific directory (auto-adds --add-dir)
-- Hidden: `--agents`, `--mcp-config`, `--settings`, `--max-turns`, `--tools`, `--allowed-tools`, `--include-partial-messages`
+### 1. ManifoldDB Integration (MAJOR)
+Integrated ManifoldDB as the graph database backend for storing Claude events:
 
-### 2. UUIDv7 Session IDs
-- Session IDs now generated upfront using UUIDv7 (time-ordered)
-- Passed to Claude via `--session-id` flag
-- No more hook-based session detection needed
-- See `generate_session_id()` in `src/cli/commands.rs`
+- **Added ManifoldDB dependencies** to `Cargo.toml`:
+  - `manifoldb-core` - Entity, Edge, Value types
+  - `manifoldb-storage` - RedbEngine backend
+  - `manifoldb-graph` - NodeStore, EdgeStore, IdGenerator
 
-### 3. Added Dependencies
-- `uuid` with v7 feature
-- `axum` with websocket feature
-- `tower-http` for CORS/static files
-- `tokio-stream` for streaming
+- **Created `src/db/graph.rs`** - New graph database module:
+  - `GraphDatabase` struct wraps ManifoldDB RedbEngine
+  - Events stored as entities with label "Event"
+  - Parent-child edges via `parent_tool_use_id` → CHILD_OF edge
+  - Indexes: `uuid_index` and `tool_use_index` for fast lookups
+  - Fork/Session/Job CRUD operations (ready for migration)
 
-### 4. Serve Command Stubbed
-- `forky serve --port 3847` command added
-- Will start WebSocket server for observability
-- Not yet implemented
+- **Enhanced `src/claude/events.rs`**:
+  - Added `uuid` and `parent_tool_use_id` fields for event chaining
+  - Added `tool_use_ids` extraction from content blocks
+  - New fields: `total_cost_usd`, `duration_ms`, `num_turns`
+  - Stored raw JSON for full fidelity
+
+- **Updated `src/claude/spawn.rs`**:
+  - `ClaudeResult` now includes `events: Vec<ClaudeEvent>`
+  - All parsed events collected during streaming
+
+- **Integrated in `src/cli/commands.rs`**:
+  - After spawn completes, all events stored in GraphDatabase
+  - Silent fallback if graph DB unavailable
+
+### 2. Previous Session Work (still in place)
+All Claude CLI flags wired up:
+- `--chrome` / `--no-chrome`
+- `--system-prompt` / `--append-system-prompt`
+- `--worktree` (stubbed)
+- `--dir`
+- Hidden: `--agents`, `--mcp-config`, `--settings`, `--max-turns`, `--tools`, `--allowed-tools`
+
+UUIDv7 session IDs for time-ordered, visually distinct sessions.
+
+## Event Graph Structure
+
+Events form chains via `parent_tool_use_id`:
+
+```
+[Assistant Message uuid:A] ──contains──> [tool_use id:"toolu_123"]
+                                              │
+                                              │ CHILD_OF
+                                              ▼
+                         [User Message uuid:B, parent_tool_use_id:"toolu_123"]
+                                              │
+                                              │ (next turn)
+                                              ▼
+                         [Assistant Message uuid:C, parent_tool_use_id:"toolu_123"]
+```
+
+The `tool_use_index` maps tool_use IDs to the entity containing them,
+enabling fast parent lookups when creating CHILD_OF edges.
 
 ## TODO (Priority Order)
 
-### 1. ManifoldDB Integration (NEXT)
-Replace SQLite with ManifoldDB in `src/db/`:
-- `connection.rs` - Replace `rusqlite::Connection` with ManifoldDB
-- `queries.rs` - Convert SQL queries to entity/edge operations
-- Schema maps well to graph:
-  - Fork → entity with edges to parent_session, child_session
-  - Session → entity
-  - Job → entity with edge to Fork
-  - Message → entity with edge to Fork/Session
-
-ManifoldDB path: `/Users/tom/Developer/spaces/manifoldb`
+### 1. Complete SQLite → ManifoldDB Migration
+The GraphDatabase has all the methods ready. Need to:
+- Update `execute()` to use GraphDatabase instead of Database
+- Update list commands to query graph entities
+- Remove SQLite dependency once verified
 
 ### 2. Worktree Support
 In `run_fork()` when `opts.worktree` is true:
@@ -62,12 +89,16 @@ Simple HTML/JS page:
 - Connect to WebSocket
 - Show live feed of fork events
 - Display fork status, messages, costs
+- Navigate event chains
 
 ## Key Files
 - `src/cli/args.rs` - CLI argument definitions
-- `src/cli/commands.rs` - Command execution, `ForkOptions` struct
-- `src/claude/spawn.rs` - `ClaudeOptions` struct, spawn logic
-- `src/db/` - SQLite layer (to be replaced with ManifoldDB)
+- `src/cli/commands.rs` - Command execution, ForkOptions, GraphDatabase integration
+- `src/claude/spawn.rs` - ClaudeOptions, spawn logic, event collection
+- `src/claude/events.rs` - ClaudeEvent with full schema support
+- `src/db/graph.rs` - ManifoldDB GraphDatabase (NEW)
+- `src/db/connection.rs` - SQLite (legacy, to be removed)
+- `src/db/queries.rs` - SQLite queries (legacy, to be removed)
 
 ## Related Directories
 - `/Users/tom/Developer/spaces/tooling/claude-plugins/forky` - Plugin repo with hooks/commands
@@ -80,3 +111,7 @@ cd /Users/tom/Developer/spaces/tooling/claude-plugins/workspace/rust
 cargo build --release
 ./target/release/forky --help
 ```
+
+## Database Location
+- SQLite (legacy): `.claude/mod-claude/forky.db`
+- ManifoldDB: `.claude/mod-claude/forky.redb`

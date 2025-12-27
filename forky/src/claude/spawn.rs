@@ -52,6 +52,14 @@ pub struct ClaudeOptions {
     pub allowed_tools: Option<String>,
     /// Include partial streaming messages.
     pub include_partial_messages: bool,
+
+    // === Streaming Options ===
+    /// Server URL for real-time event streaming.
+    pub stream_url: Option<String>,
+    /// Fork ID for event attribution.
+    pub fork_id: Option<String>,
+    /// Project path for database routing.
+    pub project_path: Option<String>,
 }
 
 /// Result from a Claude session.
@@ -67,6 +75,8 @@ pub struct ClaudeResult {
     pub success: bool,
     /// Total cost in USD.
     pub cost_usd: Option<f64>,
+    /// All parsed events (for graph storage).
+    pub events: Vec<ClaudeEvent>,
 }
 
 /// Spawn a Claude CLI process and stream events.
@@ -177,7 +187,11 @@ pub async fn spawn_claude(options: ClaudeOptions) -> Result<ClaudeResult> {
         result: None,
         success: false,
         cost_usd: None,
+        events: Vec::new(),
     };
+
+    // HTTP client for real-time streaming (reuse for efficiency)
+    let http_client = options.stream_url.as_ref().map(|_| reqwest::Client::new());
 
     // Process stdout (NDJSON events)
     loop {
@@ -207,7 +221,29 @@ pub async fn spawn_claude(options: ClaudeOptions) -> Result<ClaudeResult> {
                                 if event.cost_usd.is_some() {
                                     result.cost_usd = event.cost_usd;
                                 }
+                                // Use total_cost_usd if available (more accurate)
+                                if event.total_cost_usd.is_some() {
+                                    result.cost_usd = event.total_cost_usd;
+                                }
                             }
+
+                            // Stream event to server in real-time
+                            if let (Some(client), Some(url)) = (&http_client, &options.stream_url) {
+                                let body = serde_json::json!({
+                                    "project_path": options.project_path,
+                                    "fork_id": options.fork_id,
+                                    "events": [event.raw],
+                                });
+                                // Fire and forget - don't block on response
+                                let client = client.clone();
+                                let url = url.clone();
+                                tokio::spawn(async move {
+                                    let _ = client.post(&url).json(&body).send().await;
+                                });
+                            }
+
+                            // Store event for graph database
+                            result.events.push(event);
                         }
                     }
                     Ok(None) => break,

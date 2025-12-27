@@ -1,15 +1,17 @@
 //! Forky - Fork Claude sessions to handle side tasks in parallel.
 //!
 //! This CLI tool allows you to spawn and manage parallel Claude sessions,
-//! tracking forks, sessions, jobs, and messages in a local `SQLite` database.
-
-// CLI application doesn't need Send futures - rusqlite::Connection is not Sync
-#![allow(clippy::future_not_send)]
+//! tracking forks and events in a ManifoldDB graph database.
+//!
+//! Architecture:
+//! - CLI is a thin client that talks to the forky server via HTTP
+//! - Server manages per-project ManifoldDB databases
+//! - All database access goes through the server to avoid lock contention
 
 mod claude;
 mod cli;
 mod db;
-mod models;
+mod server;
 mod session;
 
 use anyhow::Result;

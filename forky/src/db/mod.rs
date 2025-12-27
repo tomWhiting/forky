@@ -1,7 +1,8 @@
-//! Database module for `SQLite` operations.
+//! Database module for Forky storage.
+//!
+//! Uses ManifoldDB graph database for all storage.
+//! The server manages database access to avoid lock contention.
 
-mod connection;
-mod queries;
+mod graph;
 
-pub use connection::Database;
-pub use queries::{ForkQueries, JobQueries, MessageQueries, SessionQueries};
+pub use graph::GraphDatabase;

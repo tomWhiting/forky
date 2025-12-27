@@ -154,12 +154,23 @@ pub enum Commands {
     /// Start the streaming server for fork observability
     Serve {
         /// Port to listen on
-        #[arg(short, long, default_value = "3847")]
+        #[arg(short, long, default_value = "58231")]
         port: u16,
 
         /// Open browser automatically
         #[arg(long)]
         open: bool,
+    },
+
+    /// Debug: show events stored in the graph database
+    Events {
+        /// Session ID to filter by (optional)
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Maximum number of events to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
     },
 }
 

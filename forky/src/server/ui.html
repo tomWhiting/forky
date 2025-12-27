@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forky Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #30363d;
+            margin-bottom: 20px;
+        }
+        h1 { font-size: 24px; font-weight: 600; }
+        .status { font-size: 14px; color: #8b949e; }
+        .status.connected { color: #3fb950; }
+        .status.disconnected { color: #f85149; }
+
+        .grid { display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
+
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .panel-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid #30363d;
+            font-weight: 600;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .panel-content { padding: 0; }
+
+        .fork-list { list-style: none; max-height: 80vh; overflow-y: auto; }
+        .fork-item {
+            padding: 12px 16px;
+            border-bottom: 1px solid #21262d;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .fork-item:hover { background: #21262d; }
+        .fork-item.selected { background: #1f6feb33; border-left: 3px solid #1f6feb; }
+        .fork-item .fork-id { font-family: monospace; font-size: 13px; color: #58a6ff; }
+        .fork-item .fork-session { font-family: monospace; font-size: 11px; color: #8b949e; margin-top: 2px; }
+        .fork-item .fork-meta { font-size: 12px; color: #8b949e; margin-top: 4px; }
+        .fork-item .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .status-badge.completed { background: #238636; color: #fff; }
+        .status-badge.running { background: #1f6feb; color: #fff; animation: pulse 2s infinite; }
+        .status-badge.failed { background: #da3633; color: #fff; }
+        .status-badge.unknown { background: #484f58; color: #c9d1d9; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .event-list { list-style: none; max-height: 80vh; overflow-y: auto; }
+        .event-item {
+            padding: 16px;
+            border-bottom: 1px solid #21262d;
+            font-size: 13px;
+        }
+        .event-item.new { animation: highlight 1s ease-out; }
+        @keyframes highlight {
+            from { background: #1f6feb33; }
+            to { background: transparent; }
+        }
+        .event-item .event-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .event-item .event-type {
+            font-family: monospace;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            background: #30363d;
+        }
+        .event-type.system { background: #6e7681; }
+        .event-type.assistant { background: #238636; }
+        .event-type.user { background: #1f6feb; }
+        .event-type.result { background: #a371f7; }
+        .event-type.error { background: #da3633; }
+        .event-item .event-uuid { font-family: monospace; font-size: 11px; color: #8b949e; }
+        .event-item .event-content {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 8px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: #e6edf3;
+            line-height: 1.6;
+            font-size: 13px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .event-item .event-meta {
+            font-size: 11px;
+            color: #8b949e;
+            margin-top: 8px;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .event-meta span { display: flex; align-items: center; gap: 4px; }
+
+        .raw-toggle {
+            font-size: 11px;
+            color: #58a6ff;
+            cursor: pointer;
+            margin-left: 8px;
+        }
+        .raw-toggle:hover { text-decoration: underline; }
+        .raw-json {
+            display: none;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 8px;
+            font-family: monospace;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .raw-json.visible { display: block; }
+
+        .empty { padding: 40px; text-align: center; color: #8b949e; }
+
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Forky Dashboard</h1>
+            <span id="ws-status" class="status disconnected">Disconnected</span>
+        </header>
+
+        <div class="grid">
+            <div class="panel">
+                <div class="panel-header">
+                    <span>Forks</span>
+                    <span id="fork-count" style="font-weight: normal; color: #8b949e;"></span>
+                </div>
+                <div class="panel-content">
+                    <ul id="fork-list" class="fork-list">
+                        <li class="empty">Loading...</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <span>Events <span id="event-count"></span></span>
+                    <span id="selected-fork" style="font-family: monospace; font-size: 12px; color: #58a6ff;"></span>
+                </div>
+                <div class="panel-content">
+                    <ul id="event-list" class="event-list">
+                        <li class="empty">Select a fork to view events</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedForkId = null;
+        let selectedSessionId = null;
+        let ws = null;
+
+        // Fetch and display forks
+        async function loadForks() {
+            try {
+                const res = await fetch('/api/forks');
+                const forks = await res.json();
+
+                const list = document.getElementById('fork-list');
+                const count = document.getElementById('fork-count');
+                count.textContent = forks.length > 0 ? `(${forks.length})` : '';
+
+                if (forks.length === 0) {
+                    list.innerHTML = '<li class="empty">No forks yet</li>';
+                    return;
+                }
+
+                list.innerHTML = forks.map(f => `
+                    <li class="fork-item ${f.fork_id === selectedForkId ? 'selected' : ''}"
+                        data-fork-id="${f.fork_id || ''}"
+                        data-session-id="${f.session_id || ''}">
+                        <div class="fork-id">${escapeHtml(f.fork_id)}</div>
+                        <div class="fork-session">${f.session_id ? escapeHtml(f.session_id) : 'No session'}</div>
+                        <div class="fork-meta">
+                            <span class="status-badge ${f.status}">${f.status}</span>
+                            ${f.event_count} events
+                        </div>
+                    </li>
+                `).join('');
+
+                // Add click handlers
+                list.querySelectorAll('.fork-item').forEach(item => {
+                    item.addEventListener('click', () => {
+                        selectedForkId = item.dataset.forkId;
+                        selectedSessionId = item.dataset.sessionId;
+                        document.getElementById('selected-fork').textContent = selectedForkId;
+                        loadForks(); // Refresh to update selection
+                        loadEvents();
+                    });
+                });
+            } catch (e) {
+                console.error('Failed to load forks:', e);
+            }
+        }
+
+        // Fetch and display events
+        async function loadEvents() {
+            if (!selectedSessionId && !selectedForkId) return;
+
+            try {
+                const query = selectedSessionId ? `session=${selectedSessionId}` : `fork_id=${selectedForkId}`;
+                const res = await fetch(`/api/events?${query}&limit=200`);
+                const events = await res.json();
+
+                const list = document.getElementById('event-list');
+                const count = document.getElementById('event-count');
+                count.textContent = `(${events.length})`;
+
+                if (events.length === 0) {
+                    list.innerHTML = '<li class="empty">No events yet</li>';
+                    return;
+                }
+
+                list.innerHTML = events.map((e, i) => {
+                    const content = extractContent(e);
+                    const rawJson = e.raw ? JSON.stringify(e.raw, null, 2) : null;
+
+                    return `
+                        <li class="event-item" data-uuid="${e.uuid || ''}">
+                            <div class="event-header">
+                                <span>
+                                    <span class="event-type ${e.event_type}">${e.event_type}${e.subtype ? ':' + e.subtype : ''}</span>
+                                    ${rawJson ? `<span class="raw-toggle" onclick="toggleRaw(${i})">Show raw</span>` : ''}
+                                </span>
+                                <span class="event-uuid">${e.uuid ? e.uuid.substring(0, 12) : '-'}</span>
+                            </div>
+                            ${content ? `<div class="event-content">${escapeHtml(content)}</div>` : ''}
+                            ${rawJson ? `<div class="raw-json" id="raw-${i}">${escapeHtml(rawJson)}</div>` : ''}
+                            <div class="event-meta">
+                                ${e.fork_id ? `<span>Fork: ${e.fork_id}</span>` : ''}
+                                ${e.parent_tool_use_id ? `<span>Parent: ${e.parent_tool_use_id.substring(0, 12)}...</span>` : ''}
+                                ${e.total_cost_usd ? `<span>Cost: $${e.total_cost_usd.toFixed(4)}</span>` : ''}
+                            </div>
+                        </li>
+                    `;
+                }).join('');
+            } catch (e) {
+                console.error('Failed to load events:', e);
+            }
+        }
+
+        // Extract readable content from event
+        function extractContent(event) {
+            // First try the message field
+            if (event.message) return event.message;
+
+            // Then try to extract from raw JSON
+            if (!event.raw) return null;
+
+            const raw = event.raw;
+
+            // For assistant messages, extract text from content blocks
+            if (raw.message && raw.message.content) {
+                const texts = raw.message.content
+                    .filter(b => b.type === 'text')
+                    .map(b => b.text);
+                if (texts.length > 0) return texts.join('\n\n');
+            }
+
+            // For result events
+            if (raw.result) return raw.result;
+
+            // For user messages
+            if (raw.content) {
+                if (typeof raw.content === 'string') return raw.content;
+                if (Array.isArray(raw.content)) {
+                    const texts = raw.content
+                        .filter(b => b.type === 'text')
+                        .map(b => b.text);
+                    if (texts.length > 0) return texts.join('\n\n');
+                }
+            }
+
+            return null;
+        }
+
+        function toggleRaw(index) {
+            const el = document.getElementById(`raw-${index}`);
+            if (el) {
+                el.classList.toggle('visible');
+                const toggle = el.previousElementSibling?.previousElementSibling?.querySelector('.raw-toggle');
+                if (toggle) {
+                    toggle.textContent = el.classList.contains('visible') ? 'Hide raw' : 'Show raw';
+                }
+            }
+        }
+
+        // WebSocket connection for real-time updates
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('ws-status').textContent = 'Live';
+                document.getElementById('ws-status').className = 'status connected';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-status').textContent = 'Disconnected';
+                document.getElementById('ws-status').className = 'status disconnected';
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data);
+                // Refresh fork list
+                loadForks();
+
+                // If viewing this session, add the event
+                if (selectedSessionId && data.event.session_id === selectedSessionId) {
+                    loadEvents();
+                } else if (selectedForkId && data.fork_id === selectedForkId) {
+                    loadEvents();
+                }
+            };
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Initialize
+        loadForks();
+        connectWebSocket();
+
+        // Auto-refresh forks every 10 seconds (WebSocket handles real-time)
+        setInterval(loadForks, 10000);
+    </script>
+</body>
+</html>
