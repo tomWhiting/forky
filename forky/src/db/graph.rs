@@ -353,8 +353,13 @@ impl GraphDatabase {
         Ok(entity.id)
     }
 
-    /// Update fork status.
-    pub fn update_fork_status(&self, fork_id: &str, status: &str) -> Result<()> {
+    /// Update fork status and optionally set session_id.
+    pub fn update_fork_status(
+        &self,
+        fork_id: &str,
+        status: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         let tx = self.engine.begin_read()?;
         let fork_ids = NodeStore::find_by_label(&tx, &LABEL_FORK.into())?;
         drop(tx);
@@ -370,6 +375,11 @@ impl GraphDatabase {
                         updated
                             .properties
                             .insert("status".to_string(), Value::String(status.to_string()));
+                        if let Some(sid) = session_id {
+                            updated
+                                .properties
+                                .insert("session_id".to_string(), Value::String(sid.to_string()));
+                        }
                         if status == "completed" || status == "failed" {
                             updated.properties.insert(
                                 "completed_at".to_string(),

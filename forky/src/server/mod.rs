@@ -422,7 +422,7 @@ async fn update_fork(
         .get(&project_path)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    db.update_fork_status(&fork_id, &req.status)
+    db.update_fork_status(&fork_id, &req.status, req.session_id.as_deref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({"success": true})))
