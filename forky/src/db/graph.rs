@@ -331,6 +331,7 @@ impl GraphDatabase {
         fork_id: &str,
         parent_session_id: Option<&str>,
         status: &str,
+        fork_name: Option<&str>,
     ) -> Result<EntityId> {
         let mut tx = self.engine.begin_write()?;
 
@@ -344,6 +345,10 @@ impl GraphDatabase {
 
             if let Some(pid) = parent_session_id {
                 e = e.with_property("parent_session_id", Value::String(pid.to_string()));
+            }
+
+            if let Some(name) = fork_name {
+                e = e.with_property("fork_name", Value::String(name.to_string()));
             }
 
             e
@@ -599,7 +604,7 @@ mod tests {
             Some(&Value::String("running".to_string()))
         );
 
-        db.update_fork_status("fork-1", "completed").unwrap();
+        db.update_fork_status("fork-1", "completed", None).unwrap();
 
         let fork = db.get_fork("fork-1").unwrap().unwrap();
         assert_eq!(

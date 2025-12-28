@@ -1,0 +1,13 @@
+{
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "command": "bash -c 'echo \"$CLAUDE_TOOL_INPUT\" | grep -q \"forky spawn\\|forky fork\" && echo \"BLOCK: Use the Forky skill instead of running forky commands directly\" && exit 1 || exit 0'"
+    },
+    {
+      "event": "Stop",
+      "command": "bash -c '[ -f ~/.forky/notifications/pending.txt ] && cat ~/.forky/notifications/pending.txt && rm ~/.forky/notifications/pending.txt 2>/dev/null || true'"
+    }
+  ]
+}

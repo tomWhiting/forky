@@ -1,1 +1,40 @@
+# Build artifacts
 /target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code session data (sensitive)
+.claude/
+current-session.json
+current_sessions.json
+sessions.jsonl
+
+# Forky databases (contain session data)
+*.db
+*.redb
+forky.db
+forky.redb
+
+# Environment and credentials
+.env
+.env.*
+*.pem
+*.key
+credentials*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Parquet exports (may contain session data)
+exports/
+*.parquet

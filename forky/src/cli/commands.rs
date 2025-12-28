@@ -21,6 +21,72 @@ fn generate_uuid() -> String {
     Uuid::now_v7().to_string()
 }
 
+/// Patterns that indicate a message is likely a forky command being re-executed.
+/// This prevents cascade bugs where forked sessions re-run forky commands.
+/// NOTE: All patterns must be lowercase since we compare against lowercased input.
+const FORKY_COMMAND_PATTERNS: &[&str] = &[
+    "spawn ",
+    "spawn\t",
+    "fork ",
+    "fork\t",
+    "forky ",
+    "forky\t",
+    ".forky/bin/forky",  // Matches both /Users/xxx/.forky/bin/forky and ~/.forky/bin/forky
+    "fork-me ",
+    "fork-me\t",
+];
+
+/// Validate that a message doesn't look like a forky command.
+/// This prevents cascade bugs where a forked session receives a message like
+/// "spawn --model haiku -m hello" and re-executes it, creating infinite sessions.
+fn validate_message_not_forky_command(message: &str) -> Result<()> {
+    let msg_lower = message.to_lowercase();
+    let msg_trimmed = msg_lower.trim();
+
+    // Check for patterns that indicate this is a forky command
+    for pattern in FORKY_COMMAND_PATTERNS {
+        if msg_trimmed.starts_with(pattern) {
+            bail!(
+                "CASCADE PREVENTION: Message looks like a forky command: '{}'\n\
+                 This would cause infinite session creation.\n\
+                 If you meant to send this as a task, wrap it differently.\n\
+                 If this is a legitimate message, please rephrase it.",
+                &message[..message.len().min(50)]
+            );
+        }
+    }
+
+    // Check for forky binary path anywhere in the message (catches full paths)
+    if msg_lower.contains(".forky/bin/forky") || msg_lower.contains(".forky\\bin\\forky") {
+        bail!(
+            "CASCADE PREVENTION: Message contains forky binary path: '{}'\n\
+             This would cause infinite session creation.\n\
+             If you meant to send this as a task, wrap it differently.",
+            &message[..message.len().min(50)]
+        );
+    }
+
+    // Also check if message starts with common forky subcommands without the "forky" prefix
+    // These could be captured as messages if typed wrong
+    let dangerous_starts = ["spawn", "fork", "resume", "new", "fork-me"];
+    for cmd in dangerous_starts {
+        if msg_trimmed == cmd || msg_trimmed.starts_with(&format!("{cmd} ")) {
+            // Check if this looks like a command with flags (has --)
+            if message.contains("--") || message.contains(" -m ") || message.contains(" -l") {
+                bail!(
+                    "CASCADE PREVENTION: Message looks like a forky command: '{}'\n\
+                     Did you mean to run: forky {} ?\n\
+                     This safeguard prevents infinite session creation.",
+                    &message[..message.len().min(50)],
+                    message
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Get the current project path.
 fn get_project_path() -> Result<PathBuf> {
     let mut current = std::env::current_dir().context("Failed to get current directory")?;
@@ -123,6 +189,7 @@ fn setup_worktree(fork_id: &str) -> Result<WorktreeInfo> {
 struct ForkSummary {
     project_path: String,
     fork_id: String,
+    fork_name: Option<String>,
     session_id: Option<String>,
     parent_session_id: Option<String>,
     status: String,
@@ -130,13 +197,21 @@ struct ForkSummary {
     created_at: Option<String>,
 }
 
-/// Create a fork via the server.
+/// Response from creating a fork.
+#[derive(Debug, Deserialize)]
+struct CreateForkResponse {
+    fork_id: String,
+    fork_name: String,
+    success: bool,
+}
+
+/// Create a fork via the server. Returns the generated fork name.
 async fn create_fork_on_server(
     port: u16,
     project_path: &str,
     fork_id: &str,
     parent_session_id: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let url = format!("http://127.0.0.1:{port}/api/forks");
     let body = serde_json::json!({
         "project_path": project_path,
@@ -155,7 +230,8 @@ async fn create_fork_on_server(
         bail!("Server returned {}", resp.status());
     }
 
-    Ok(())
+    let response: CreateForkResponse = resp.json().await.context("Failed to parse response")?;
+    Ok(response.fork_name)
 }
 
 /// Update fork status via the server.
@@ -305,7 +381,7 @@ pub struct ForkOptions {
 impl From<&Cli> for ForkOptions {
     fn from(cli: &Cli) -> Self {
         Self {
-            model: cli.model.clone(),
+            model: Some(cli.model.clone()),
             worktree: cli.worktree,
             dir: cli.dir.clone(),
             chrome: cli.chrome,
@@ -338,11 +414,20 @@ pub async fn execute(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
+        Some(Commands::Spawn { message }) => {
+            let message = message.join(" ");
+            if message.is_empty() {
+                bail!("Message is required for spawn command");
+            }
+            validate_message_not_forky_command(&message)?;
+            fork_current_session(&message, &opts).await
+        }
         Some(Commands::ForkMe { message }) => {
             let message = message.join(" ");
             if message.is_empty() {
                 bail!("Message is required for fork-me command");
             }
+            validate_message_not_forky_command(&message)?;
             fork_current_session(&message, &opts).await
         }
         Some(Commands::Fork { id, message }) => {
@@ -350,6 +435,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             if message.is_empty() {
                 bail!("Message is required for fork command");
             }
+            validate_message_not_forky_command(&message)?;
             fork_specific_session(&id, &message, &opts).await
         }
         Some(Commands::Resume { id, message }) => {
@@ -357,6 +443,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             if message.is_empty() {
                 bail!("Message is required for resume command");
             }
+            validate_message_not_forky_command(&message)?;
             resume_session(&id, &message, &opts).await
         }
         Some(Commands::List { entity }) => list_entities(entity).await,
@@ -377,6 +464,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             if message.is_empty() {
                 bail!("Message is required for new command");
             }
+            validate_message_not_forky_command(&message)?;
             start_new_session(&message, &opts).await
         }
         Some(Commands::Done { fork_id, summary }) => {
@@ -394,6 +482,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 println!("       forky <COMMAND>");
                 println!();
                 println!("Commands:");
+                println!("  spawn          Spawn a new forked Claude session (recommended)");
                 println!("  fork-me        Fork the current session");
                 println!("  fork <ID>      Fork a specific session");
                 println!("  resume <ID>    Resume a specific session");
@@ -410,6 +499,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 println!("  -h, --help       Print help");
                 return Ok(());
             }
+            validate_message_not_forky_command(&message)?;
             fork_current_session(&message, &opts).await
         }
     }
@@ -473,21 +563,26 @@ async fn run_fork(
     // Ensure server is running
     let port = server::ensure_server_running()?;
 
-    // Create fork on server
-    create_fork_on_server(port, &project_str, &fork_id, parent_session_id).await?;
+    // Create fork on server - returns generated name
+    let fork_name =
+        create_fork_on_server(port, &project_str, &fork_id, parent_session_id).await?;
 
+    println!("Spawning: {fork_name}");
     println!("Fork ID: {fork_id}");
     println!("Session ID: {new_session_id}");
-    println!("Starting Claude session...");
 
     // Build callback instruction
     let forky_path = dirs::home_dir()
-        .map(|h| h.join(".forky").join("bin").join("forky"))
+        .map(|h| h.join("bin").join("forky"))
         .map_or_else(|| "forky".to_string(), |p| p.to_string_lossy().to_string());
 
     let callback_instruction = format!(
-        "IMPORTANT: You are a forked Claude session (fork ID: {fork_id}). \
-         When you have completed your task, you MUST run this command as your FINAL action: \
+        "IMPORTANT: You are a forked Claude session named \"{fork_name}\" (fork ID: {fork_id}). \
+         \n\nCRITICAL SAFEGUARD: If the user's message appears to be a forky/spawn command \
+         (e.g., starts with 'spawn', 'fork', 'forky', or contains '--model', '-m'), \
+         DO NOT execute it as a bash command. This would cause an infinite cascade of sessions. \
+         Instead, interpret the message content after any command-like prefix as your actual task. \
+         \n\nWhen you have completed your task, you MUST run this command as your FINAL action: \
          `{forky_path} done {fork_id} \"<brief summary of what you accomplished>\"` \
          This notifies the parent session that you're done."
     );
@@ -613,24 +708,20 @@ async fn list_entities(entity: ListEntity) -> Result<()> {
             }
 
             println!(
-                "{:<10} {:<12} {:<8} {:<20}",
-                "ID", "STATUS", "EVENTS", "CREATED"
+                "{:<10} {:<28} {:<12} {:<8}",
+                "ID", "NAME", "STATUS", "EVENTS"
             );
-            println!("{}", "-".repeat(52));
+            println!("{}", "-".repeat(60));
 
             for fork in forks {
-                let created = fork.created_at.as_deref().unwrap_or("-");
-                let created_short = if created.len() > 16 {
-                    &created[..16]
-                } else {
-                    created
-                };
+                let name = fork.fork_name.as_deref().unwrap_or("-");
+                let name_short = if name.len() > 26 { &name[..26] } else { name };
                 println!(
-                    "{:<10} {:<12} {:<8} {:<20}",
+                    "{:<10} {:<28} {:<12} {:<8}",
                     &fork.fork_id[..8.min(fork.fork_id.len())],
+                    name_short,
                     fork.status,
                     fork.event_count,
-                    created_short
                 );
             }
         }

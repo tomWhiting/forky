@@ -91,19 +91,27 @@ pub async fn spawn_claude(options: ClaudeOptions) -> Result<ClaudeResult> {
     cmd.arg("--output-format").arg("stream-json");
     cmd.arg("--verbose");
 
-    // Explicit session ID (UUIDv7, set upfront)
+    // Session ID handling - IMPORTANT: --fork-session and --session-id conflict!
+    // When --fork-session is used, Claude Code ignores --session-id and creates its own UUID.
+    // This caused a cascade bug where forky lost track of sessions.
+    //
+    // Our strategy:
+    // - If we have an explicit_session_id (UUIDv7), use ONLY --session-id (no forking)
+    // - If we want to fork, DON'T use explicit_session_id (let Claude generate)
+    // - Never use both --fork-session and --session-id together
     if let Some(ref session_id) = options.explicit_session_id {
+        // Use our controlled session ID - do NOT fork (it would override our ID)
         cmd.arg("--session-id").arg(session_id);
-    }
-
-    // Resume session if provided
-    if let Some(ref session_id) = options.session_id {
-        cmd.arg("-r").arg(session_id);
-    }
-
-    // Fork session if requested
-    if options.fork_session {
+        // Note: We intentionally skip --fork-session here to preserve our session ID
+    } else if options.fork_session {
+        // No explicit ID requested, allow Claude to fork and generate its own ID
+        if let Some(ref session_id) = options.session_id {
+            cmd.arg("-r").arg(session_id);
+        }
         cmd.arg("--fork-session");
+    } else if let Some(ref session_id) = options.session_id {
+        // Resume existing session without forking
+        cmd.arg("-r").arg(session_id);
     }
 
     // Model if specified

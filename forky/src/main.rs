@@ -11,6 +11,8 @@
 mod claude;
 mod cli;
 mod db;
+mod names;
+mod process;
 mod server;
 mod session;
 

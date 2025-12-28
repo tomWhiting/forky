@@ -1,0 +1,10 @@
+{
+  "name": "forky",
+  "version": "0.1.0",
+  "description": "Fork Claude sessions to handle side tasks in parallel",
+  "author": "Tom",
+  "repository": "https://github.com/khitomer/forky",
+  "license": "MIT",
+  "keywords": ["fork", "parallel", "sessions", "subagent", "background"],
+  "claude_code_version": ">=1.0.0"
+}

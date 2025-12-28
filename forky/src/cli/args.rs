@@ -11,9 +11,10 @@ pub struct Cli {
     #[arg(short = 'l', long = "last")]
     pub message_last: bool,
 
-    /// Model to use for Claude (e.g., sonnet, opus, haiku)
-    #[arg(short, long)]
-    pub model: Option<String>,
+    /// Model to use for Claude (opus, sonnet, haiku).
+    /// Defaults to opus—always use opus unless explicitly told otherwise.
+    #[arg(short, long, default_value = "opus")]
+    pub model: String,
 
     // === Directory / Worktree Options ===
     /// Run in a git worktree (creates branch forky/<fork-id>)
@@ -83,6 +84,16 @@ pub struct Cli {
 /// Available subcommands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Spawn a new forked Claude session (alias for default behavior)
+    ///
+    /// This is the recommended way to create a fork. Example:
+    ///   forky spawn "please review the code in src/main.rs"
+    Spawn {
+        /// Message to send to the fork
+        #[arg(trailing_var_arg = true)]
+        message: Vec<String>,
+    },
+
     /// Fork the current session (explicit command)
     ForkMe {
         /// Message to send to the fork

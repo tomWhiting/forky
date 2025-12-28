@@ -202,6 +202,7 @@
           ${forks.map(fork => {
             const isSelected = state.selectedFork?.fork_id === fork.fork_id;
             const statusColor = getStatusColor(fork.status);
+            const name = fork.fork_name || fork.fork_id.slice(0, 8);
 
             return `
               <button
@@ -210,9 +211,9 @@
               >
                 <div class="flex items-center gap-2 mb-1">
                   <span class="w-1.5 h-1.5 rounded-full ${statusColor} shrink-0"></span>
-                  <span class="text-xs font-mono break-all">${escapeHtml(fork.fork_id)}</span>
+                  <span class="text-sm font-medium truncate" title="${escapeAttr(name)}">${escapeHtml(name.length > 24 ? name.slice(0, 24) + '...' : name)}</span>
                 </div>
-                <div class="text-xs text-muted pl-3">${fork.event_count} events</div>
+                <div class="text-xs text-muted pl-3">${fork.fork_id.slice(0, 8)} · ${fork.event_count} events</div>
               </button>
             `;
           }).join('')}
@@ -335,8 +336,8 @@
       // Update header
       $forkHeader.classList.remove('hidden');
       $inputArea.classList.remove('hidden');
-      $forkTitle.textContent = forkId;
-      $forkInfo.textContent = fork.session_id || '(not set)';
+      $forkTitle.textContent = fork.fork_name || forkId;
+      $forkInfo.textContent = forkId;
 
       const statusColor = getStatusBadgeClasses(fork.status);
       $forkStatus.textContent = fork.status;

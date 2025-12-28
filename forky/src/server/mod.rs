@@ -181,11 +181,13 @@ pub struct CreateForkRequest {
     pub fork_id: String,
     pub parent_session_id: Option<String>,
     pub job_description: Option<String>,
+    pub fork_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateForkResponse {
     pub fork_id: String,
+    pub fork_name: String,
     pub success: bool,
 }
 
@@ -202,6 +204,7 @@ pub struct UpdateForkRequest {
 pub struct ForkSummary {
     pub project_path: String,
     pub fork_id: String,
+    pub fork_name: Option<String>,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub status: String,
@@ -391,7 +394,7 @@ async fn create_fork(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateForkRequest>,
 ) -> Result<Json<CreateForkResponse>, StatusCode> {
-    use manifoldb_core::Value;
+    use crate::names::generate_name;
 
     let project_path = PathBuf::from(&req.project_path);
     let mut db_manager = state.db_manager.write().await;
@@ -400,12 +403,21 @@ async fn create_fork(
         .get_or_create(&project_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Generate a name if not provided
+    let fork_name = req.fork_name.unwrap_or_else(|| generate_name().full_name);
+
     // Create fork entity in the graph
-    db.create_fork(&req.fork_id, req.parent_session_id.as_deref(), "running")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    db.create_fork(
+        &req.fork_id,
+        req.parent_session_id.as_deref(),
+        "running",
+        Some(&fork_name),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(CreateForkResponse {
         fork_id: req.fork_id,
+        fork_name,
         success: true,
     }))
 }
@@ -457,6 +469,7 @@ async fn get_fork(
         ForkSummary {
             project_path: project_path.to_string_lossy().to_string(),
             fork_id: get_str("fork_id").unwrap_or_default(),
+            fork_name: get_str("fork_name"),
             session_id: get_str("session_id"),
             parent_session_id: get_str("parent_session_id"),
             status: get_str("status").unwrap_or_else(|| "unknown".to_string()),
@@ -476,16 +489,26 @@ async fn list_forks(
     use manifoldb_graph::store::NodeStore;
     use manifoldb_storage::StorageEngine;
 
-    let db_manager = state.db_manager.read().await;
     let mut all_forks = Vec::new();
 
-    // If project_path specified, only query that project
+    // If project_path specified, load that project's database (persisted on disk)
+    // This ensures forks persist across server restarts
     let projects: Vec<PathBuf> = if let Some(ref p) = params.project_path {
-        vec![PathBuf::from(p)]
+        let project_path = PathBuf::from(p);
+        // Use write lock to potentially load database from disk
+        let mut db_manager = state.db_manager.write().await;
+        // This will load from disk if exists, or create new if not
+        if let Ok(_) = db_manager.get_or_create(&project_path) {
+            vec![project_path]
+        } else {
+            vec![]
+        }
     } else {
+        let db_manager = state.db_manager.read().await;
         db_manager.list_projects()
     };
 
+    let db_manager = state.db_manager.read().await;
     for project_path in projects {
         let Some(db) = db_manager.get(&project_path) else {
             continue;
@@ -515,6 +538,7 @@ async fn list_forks(
                         ForkSummary {
                             project_path: project_path.to_string_lossy().to_string(),
                             fork_id,
+                            fork_name: get_str("fork_name"),
                             session_id: get_str("session_id"),
                             parent_session_id: get_str("parent_session_id"),
                             status: get_str("status").unwrap_or_else(|| "running".to_string()),
